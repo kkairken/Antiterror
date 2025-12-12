@@ -5,19 +5,17 @@ for more accurate face recognition and reduced duplicate IDs.
 """
 import argparse
 import time
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
 import torch
 from loguru import logger
-import threading
-import http.server
-import socketserver
 
 from .association import AssociationEngine
 from .behavior import BehaviorAnalyzer
 from .config import PipelineConfig, select_device
+from .database import Database
 from .detection import Detector
 from .embeddings import BagEmbedder, EmbeddingStore, FaceEmbedder, FaceQuality
 from .events import EventSink
@@ -26,70 +24,15 @@ from .tracking import Tracker
 from .video import open_video_source, read_frame, release
 
 
-class PreviewServer:
-    """Simple MJPEG preview server for headless environments."""
-
-    def __init__(self, port: int):
-        self.port = port
-        self.latest_jpeg: Optional[bytes] = None
-        self.lock = threading.Lock()
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self_inner):
-                if self_inner.path != "/":
-                    self_inner.send_response(404)
-                    self_inner.end_headers()
-                    return
-                self_inner.send_response(200)
-                self_inner.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-                self_inner.end_headers()
-                try:
-                    while True:
-                        with self.lock:
-                            jpeg = self.latest_jpeg
-                        if jpeg is None:
-                            time.sleep(0.05)
-                            continue
-                        self_inner.wfile.write(b"--frame\r\n")
-                        self_inner.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
-                        self_inner.wfile.write(jpeg)
-                        self_inner.wfile.write(b"\r\n")
-                        self_inner.wfile.flush()
-                        time.sleep(0.03)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-
-            def log_message(self_inner, format, *args):
-                return  # silence default logging
-
-        self.httpd = socketserver.ThreadingTCPServer(("0.0.0.0", port), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self.thread.start()
-        logger.info(f"Preview server started at http://localhost:{port}")
-
-    def update(self, frame: np.ndarray):
-        try:
-            ret, buf = cv2.imencode(".jpg", frame)
-            if ret:
-                with self.lock:
-                    self.latest_jpeg = buf.tobytes()
-        except Exception as e:
-            logger.warning(f"Preview encode failed: {e}")
-
-    def stop(self):
-        try:
-            self.httpd.shutdown()
-            self.httpd.server_close()
-        except Exception:
-            pass
-
 class Pipeline:
     """Video processing pipeline with face-centric tracking.
 
-    Key changes from person-body tracking:
+    Key features:
     1. Faces are tracked directly (not extracted from person boxes)
     2. Face bounding boxes are drawn instead of body boxes
     3. FaceTracker handles re-identification with gallery matching
+    4. Bags are linked to owners with persistent tracking
+    5. Database stores all relationships
     """
 
     def __init__(self, cfg: PipelineConfig):
@@ -98,6 +41,9 @@ class Pipeline:
         cfg.embeddings.device = select_device(cfg.embeddings.device)
 
         self.cfg = cfg
+
+        # Database for persistent storage
+        self.db = Database("antiterror.db")
 
         # Object detection (for bags)
         self.detector = Detector(cfg.detection)
@@ -113,7 +59,7 @@ class Pipeline:
         self.bag_embedder = BagEmbedder(cfg.embeddings)
         self.bag_store = EmbeddingStore()
 
-        # Behavior analysis
+        # Association and behavior analysis
         self.assoc = AssociationEngine(cfg.association)
         self.behavior = BehaviorAnalyzer(cfg.behavior)
         self.events = EventSink(cfg.events)
@@ -123,10 +69,11 @@ class Pipeline:
 
         # Store face boxes for association with bags
         self.current_face_tracks: List[FaceTrack] = []
-        self.render_enabled: bool = True  # can be disabled on headless systems
-        self.preview: Optional[PreviewServer] = None
 
-        logger.info("Pipeline initialized with face-centric tracking")
+        # Frame counter for periodic DB updates
+        self.frame_count = 0
+
+        logger.info("Pipeline initialized with face-centric tracking and database")
 
     def process_frame(self, frame: np.ndarray) -> None:
         """Process a single video frame.
@@ -134,10 +81,13 @@ class Pipeline:
         Pipeline:
         1. Detect faces and extract embeddings
         2. Track faces with FaceTracker (handles re-identification)
-        3. Detect and track bags (unchanged)
-        4. Associate faces with bags for behavior analysis
-        5. Render face boxes with IDs
+        3. Detect and track bags
+        4. Associate bags with face owners
+        5. Update database
+        6. Render visualization
         """
+        self.frame_count += 1
+
         # === Face Detection and Tracking ===
         face_detections = self.face_embedder(frame)
 
@@ -189,61 +139,60 @@ class Pipeline:
             )
             bag_ids[bag.track_id] = label
 
-        # === Association and Behavior ===
+        # === Association ===
         # Create person_ids dict from face tracks
         person_ids: Dict[int, str] = {}
         for ft in self.current_face_tracks:
             if ft.person_id:
                 person_ids[ft.track_id] = ft.person_id
 
-        # Associate faces with bags (using face center as person position)
-        assignments = self._associate_faces_bags(self.current_face_tracks, bag_tracks)
+        # Use improved association engine
+        assignments = self.assoc.associate(
+            face_tracks=self.current_face_tracks,
+            bag_tracks=bag_tracks,
+            person_ids=person_ids,
+            bag_ids=bag_ids
+        )
 
-        # Behavior analysis
+        # === Update Database (periodically) ===
+        if self.frame_count % 30 == 0:  # Every ~1 second at 30fps
+            self._update_database(person_ids, bag_ids, assignments)
+
+        # === Behavior Analysis ===
         events = self.behavior.update(bag_tracks, bag_ids, person_ids, assignments)
         if events:
             self.events.emit(events)
+            # Log events to database
+            for event in events:
+                self.db.log_event(
+                    event_type=event.get('type', 'unknown'),
+                    bag_id=event.get('bag_id'),
+                    person_id=event.get('person_id'),
+                    details=event
+                )
 
         # === Render ===
         self._render(frame, self.current_face_tracks, bag_tracks, bag_ids, assignments)
 
-    def _associate_faces_bags(
+    def _update_database(
         self,
-        face_tracks: List[FaceTrack],
-        bag_tracks: List
-    ) -> Dict[int, int]:
-        """Associate bags with nearest face.
+        person_ids: Dict[int, str],
+        bag_ids: Dict[int, str],
+        assignments: Dict[int, int]
+    ) -> None:
+        """Update database with current state."""
+        # Update persons
+        for track_id, person_id in person_ids.items():
+            self.db.add_person(person_id)
 
-        Simple distance-based association using face center.
-        """
-        assignments: Dict[int, int] = {}  # bag_track_id -> face_track_id
+        # Update bags and ownership
+        for bag_track_id, bag_id in bag_ids.items():
+            owner_person_id = self.assoc.get_bag_owner(bag_track_id)
+            self.db.add_bag(bag_id, owner_person_id)
 
-        if not face_tracks or not bag_tracks:
-            return assignments
-
-        for bag in bag_tracks:
-            bx = (bag.box[0] + bag.box[2]) / 2
-            by = (bag.box[1] + bag.box[3]) / 2
-
-            best_face = None
-            best_dist = float('inf')
-
-            for ft in face_tracks:
-                if ft.person_id is None:
-                    continue
-                # Face center (use bottom of face as approximate shoulder level)
-                fx = (ft.box[0] + ft.box[2]) / 2
-                fy = ft.box[3]  # Bottom of face
-
-                dist = np.sqrt((fx - bx) ** 2 + (fy - by) ** 2)
-                if dist < best_dist and dist < self.cfg.association.max_link_distance_px * 2:
-                    best_dist = dist
-                    best_face = ft
-
-            if best_face:
-                assignments[bag.track_id] = best_face.track_id
-
-        return assignments
+            if owner_person_id:
+                confidence = self.assoc.get_ownership_confidence(bag_track_id)
+                self.db.link_bag_to_person(bag_id, owner_person_id, confidence)
 
     def _render(
         self,
@@ -253,10 +202,7 @@ class Pipeline:
         bag_ids: Dict[int, str],
         assignments: Dict[int, int]
     ) -> None:
-        """Render face boxes and bag boxes on frame.
-
-        Only draws face bounding boxes (not full body).
-        """
+        """Render face boxes and bag boxes on frame."""
         # Draw face boxes
         for ft in face_tracks:
             x1, y1, x2, y2 = map(int, ft.box)
@@ -270,8 +216,13 @@ class Pipeline:
             # Draw face rectangle
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-            # Draw label
+            # Draw label with bag count
             label = ft.person_id if ft.person_id else f"?{ft.track_id}"
+            if ft.person_id:
+                bags = self.assoc.get_person_bags(ft.person_id)
+                if bags:
+                    label += f" [{len(bags)}]"  # Show bag count
+
             label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
 
             # Background for text
@@ -292,49 +243,76 @@ class Pipeline:
                 2
             )
 
-        # Draw bag boxes
+        # Draw bag boxes with owner info
         for bag in bag_tracks:
             x1, y1, x2, y2 = map(int, bag.box)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
 
-            bag_label = bag_ids.get(bag.track_id, f"B{bag.track_id}")
+            bag_id = bag_ids.get(bag.track_id, f"B{bag.track_id}")
+            owner_person_id = self.assoc.get_bag_owner(bag.track_id)
+            is_carried = self.assoc.is_bag_being_carried(bag.track_id)
+            confidence = self.assoc.get_ownership_confidence(bag.track_id)
 
-            # Find owner
-            owner_track_id = assignments.get(bag.track_id)
-            owner_label = "?"
-            if owner_track_id:
-                for ft in face_tracks:
-                    if ft.track_id == owner_track_id and ft.person_id:
-                        owner_label = ft.person_id
-                        break
+            # Color based on state
+            if is_carried:
+                color = (0, 255, 0)  # Green - being carried
+            elif owner_person_id:
+                color = (0, 165, 255)  # Orange - has owner but not carried
+            else:
+                color = (0, 0, 255)  # Red - no owner
 
-            text = f"{bag_label}->{owner_label}"
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            # Build label
+            owner_label = owner_person_id if owner_person_id else "?"
+            conf_str = f"{confidence:.0%}" if owner_person_id else ""
+            text = f"{bag_id}->{owner_label} {conf_str}"
+
+            # Label background
+            label_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            cv2.rectangle(
+                frame,
+                (x1, y1 - label_size[1] - 8),
+                (x1 + label_size[0] + 4, y1),
+                color,
+                -1
+            )
             cv2.putText(
                 frame,
                 text,
-                (x1, y1 - 5),
+                (x1 + 2, y1 - 4),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
-                (0, 165, 255),
+                (0, 0, 0),
                 2
             )
 
         # Show stats
+        num_faces = len(face_tracks)
         num_ids = len(self.face_tracker.gallery.get_all_ids())
-        stats_text = f"Faces: {len(face_tracks)} | IDs: {num_ids}"
-        cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        num_bags = len(bag_tracks)
+        ownerships = self.assoc.get_all_ownerships()
+        num_owned = len(ownerships)
 
-        if self.preview:
-            self.preview.update(frame)
+        stats_text = f"Faces: {num_faces} | IDs: {num_ids} | Bags: {num_bags} | Owned: {num_owned}"
+        cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        if self.render_enabled:
-            try:
-                cv2.imshow("AntiTerror - Face Tracking", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    raise KeyboardInterrupt
-            except Exception as e:
-                logger.warning(f"Disabling rendering due to OpenCV GUI error: {e}")
-                self.render_enabled = False
+        # Show ownership summary
+        y_offset = 55
+        for bag_id, person_id in list(ownerships.items())[:5]:  # Show top 5
+            cv2.putText(
+                frame,
+                f"{bag_id} -> {person_id}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (200, 200, 200),
+                1
+            )
+            y_offset += 20
+
+        cv2.imshow("AntiTerror - Face & Bag Tracking", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            raise KeyboardInterrupt
 
     def run(self) -> None:
         """Run the pipeline on video source."""
@@ -349,16 +327,15 @@ class Pipeline:
             logger.info("Interrupted by user")
         finally:
             release(self.cap)
-            if self.render_enabled:
-                try:
-                    cv2.destroyAllWindows()
-                except Exception as e:
-                    logger.warning(f"cv2.destroyAllWindows failed: {e}")
-            if self.preview:
-                self.preview.stop()
+            cv2.destroyAllWindows()
+
             # Log final stats
             num_ids = len(self.face_tracker.gallery.get_all_ids())
-            logger.info(f"Final identity count: {num_ids}")
+            db_stats = self.db.get_stats()
+            logger.info(f"Final stats: {num_ids} faces, {db_stats}")
+
+            # Close database
+            self.db.close()
 
 
 def parse_args():
@@ -367,7 +344,7 @@ def parse_args():
     parser.add_argument("--camera-id", type=str, default="CAM_01", help="Camera identifier")
     parser.add_argument("--conf", type=float, default=None, help="Detection confidence override")
     parser.add_argument("--abandonment-timeout", type=float, default=None, help="Seconds to flag abandoned bag")
-    parser.add_argument("--preview-port", type=int, default=None, help="Start MJPEG preview server on this port")
+    parser.add_argument("--db", type=str, default="antiterror.db", help="Database file path")
     return parser.parse_args()
 
 
@@ -382,9 +359,6 @@ def main():
         cfg.behavior.abandonment_timeout_s = args.abandonment_timeout
 
     pipeline = Pipeline(cfg)
-    if args.preview_port:
-        pipeline.preview = PreviewServer(args.preview_port)
-        pipeline.render_enabled = False  # disable local imshow if serving over HTTP
     pipeline.run()
 
 
