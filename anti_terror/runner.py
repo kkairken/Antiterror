@@ -5,12 +5,15 @@ for more accurate face recognition and reduced duplicate IDs.
 """
 import argparse
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
 import torch
 from loguru import logger
+import threading
+import http.server
+import socketserver
 
 from .association import AssociationEngine
 from .behavior import BehaviorAnalyzer
@@ -22,6 +25,63 @@ from .face_tracker import FaceTracker, FaceTrack
 from .tracking import Tracker
 from .video import open_video_source, read_frame, release
 
+
+class PreviewServer:
+    """Simple MJPEG preview server for headless environments."""
+
+    def __init__(self, port: int):
+        self.port = port
+        self.latest_jpeg: Optional[bytes] = None
+        self.lock = threading.Lock()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self_inner):
+                if self_inner.path != "/":
+                    self_inner.send_response(404)
+                    self_inner.end_headers()
+                    return
+                self_inner.send_response(200)
+                self_inner.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self_inner.end_headers()
+                try:
+                    while True:
+                        with self.lock:
+                            jpeg = self.latest_jpeg
+                        if jpeg is None:
+                            time.sleep(0.05)
+                            continue
+                        self_inner.wfile.write(b"--frame\r\n")
+                        self_inner.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
+                        self_inner.wfile.write(jpeg)
+                        self_inner.wfile.write(b"\r\n")
+                        self_inner.wfile.flush()
+                        time.sleep(0.03)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self_inner, format, *args):
+                return  # silence default logging
+
+        self.httpd = socketserver.ThreadingTCPServer(("0.0.0.0", port), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        logger.info(f"Preview server started at http://localhost:{port}")
+
+    def update(self, frame: np.ndarray):
+        try:
+            ret, buf = cv2.imencode(".jpg", frame)
+            if ret:
+                with self.lock:
+                    self.latest_jpeg = buf.tobytes()
+        except Exception as e:
+            logger.warning(f"Preview encode failed: {e}")
+
+    def stop(self):
+        try:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        except Exception:
+            pass
 
 class Pipeline:
     """Video processing pipeline with face-centric tracking.
@@ -63,6 +123,8 @@ class Pipeline:
 
         # Store face boxes for association with bags
         self.current_face_tracks: List[FaceTrack] = []
+        self.render_enabled: bool = True  # can be disabled on headless systems
+        self.preview: Optional[PreviewServer] = None
 
         logger.info("Pipeline initialized with face-centric tracking")
 
@@ -262,9 +324,17 @@ class Pipeline:
         stats_text = f"Faces: {len(face_tracks)} | IDs: {num_ids}"
         cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        cv2.imshow("AntiTerror - Face Tracking", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            raise KeyboardInterrupt
+        if self.preview:
+            self.preview.update(frame)
+
+        if self.render_enabled:
+            try:
+                cv2.imshow("AntiTerror - Face Tracking", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    raise KeyboardInterrupt
+            except Exception as e:
+                logger.warning(f"Disabling rendering due to OpenCV GUI error: {e}")
+                self.render_enabled = False
 
     def run(self) -> None:
         """Run the pipeline on video source."""
@@ -279,7 +349,13 @@ class Pipeline:
             logger.info("Interrupted by user")
         finally:
             release(self.cap)
-            cv2.destroyAllWindows()
+            if self.render_enabled:
+                try:
+                    cv2.destroyAllWindows()
+                except Exception as e:
+                    logger.warning(f"cv2.destroyAllWindows failed: {e}")
+            if self.preview:
+                self.preview.stop()
             # Log final stats
             num_ids = len(self.face_tracker.gallery.get_all_ids())
             logger.info(f"Final identity count: {num_ids}")
@@ -291,6 +367,7 @@ def parse_args():
     parser.add_argument("--camera-id", type=str, default="CAM_01", help="Camera identifier")
     parser.add_argument("--conf", type=float, default=None, help="Detection confidence override")
     parser.add_argument("--abandonment-timeout", type=float, default=None, help="Seconds to flag abandoned bag")
+    parser.add_argument("--preview-port", type=int, default=None, help="Start MJPEG preview server on this port")
     return parser.parse_args()
 
 
@@ -305,6 +382,9 @@ def main():
         cfg.behavior.abandonment_timeout_s = args.abandonment_timeout
 
     pipeline = Pipeline(cfg)
+    if args.preview_port:
+        pipeline.preview = PreviewServer(args.preview_port)
+        pipeline.render_enabled = False  # disable local imshow if serving over HTTP
     pipeline.run()
 
 
