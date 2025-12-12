@@ -195,9 +195,26 @@ class FaceEmbedder:
         aligned = self.mtcnn(frame, save_path=None)
         if aligned is None:
             return results
+
+        # Handle different return formats from MTCNN
         if isinstance(aligned, torch.Tensor):
-            aligned = [aligned]
-        embeddings = self.model(torch.stack(aligned).to(self.device))
+            if aligned.dim() == 3:
+                # Single face: [3, 160, 160] -> [1, 3, 160, 160]
+                aligned = aligned.unsqueeze(0)
+            elif aligned.dim() == 4:
+                # Multiple faces: [N, 3, 160, 160] - already correct
+                pass
+            else:
+                return results
+        elif isinstance(aligned, list):
+            # List of tensors - stack them
+            aligned = torch.stack([a for a in aligned if a is not None])
+            if len(aligned) == 0:
+                return results
+        else:
+            return results
+
+        embeddings = self.model(aligned.to(self.device))
         embeddings = F.normalize(embeddings, dim=1)
         for box, prob, emb in zip(boxes, probs, embeddings):
             if prob is None or prob < self.cfg.face_confidence:
