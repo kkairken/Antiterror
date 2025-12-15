@@ -354,13 +354,13 @@ class EmbeddingStore:
         force_threshold: float | None = None,
         create_threshold: float | None = None,
         quality: float = 1.0,
+        strict_mode: bool = False,
     ) -> tuple[str, bool, float]:
         """Return (label, created_new, best_score).
 
-        Improved logic to reduce duplicate IDs:
-        1. More aggressive matching using centroid
-        2. Double-check before creating new ID
-        3. Quality-weighted updates
+        Args:
+            strict_mode: If True (for bags), only match if truly above threshold.
+                        If False (for faces), use aggressive merging to reduce duplicates.
         """
         if not self.samples:
             label = self._new_label(prefix)
@@ -380,6 +380,22 @@ class EmbeddingStore:
         if best_label and best_score >= threshold:
             self.add_embedding(best_label, emb, quality)
             return best_label, False, best_score
+
+        # For strict mode (bags): only match if above threshold, otherwise create new
+        if strict_mode:
+            label = self._new_label(prefix)
+            path = self._maybe_save(image, save_dir, label)
+            self.samples[label] = EmbeddingSample(
+                vectors=[emb],
+                label=label,
+                image_path=path,
+                centroid=emb.clone(),
+                quality_scores=[quality]
+            )
+            logger.info(f"Created new ID {label} (strict mode, best_score was {best_score:.3f})")
+            return label, True, best_score
+
+        # --- Below is aggressive matching for faces only (strict_mode=False) ---
 
         # Secondary match: above force threshold (to reduce duplicates)
         if force_threshold is not None and best_label and best_score >= force_threshold:
@@ -405,7 +421,7 @@ class EmbeddingStore:
                 self.add_embedding(top_match, emb, quality)
                 return top_match, False, top_score
 
-        # Very low score - still prefer existing if any reasonable match
+        # Very low score - still prefer existing if any reasonable match (faces only)
         if best_label and best_score >= 0.35:
             logger.debug(f"Low-score match ({best_score:.3f}), reusing {best_label} to avoid duplicate")
             self.add_embedding(best_label, emb, quality)
