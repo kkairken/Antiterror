@@ -136,6 +136,7 @@ class Pipeline:
                 threshold=self.cfg.embeddings.bag_similarity_threshold,
                 image=cv2.cvtColor(crop, cv2.COLOR_BGR2RGB),
                 save_dir=self.cfg.persistence.bags_dir if self.cfg.persistence.save_bags else None,
+                strict_mode=True,  # Bags need separate IDs, not aggressive merging
             )
             bag_ids[bag.track_id] = label
 
