@@ -2,6 +2,12 @@
 
 This module now uses direct face tracking instead of person-body tracking
 for more accurate face recognition and reduced duplicate IDs.
+
+Features:
+- Database persistence for session continuity
+- Periodic saves for crash recovery
+- Memory cleanup for 24/7 operation
+- Gallery loading for cross-session re-identification
 """
 import argparse
 import time
@@ -22,7 +28,7 @@ from .database import Database
 from .detection import Detector
 from .embeddings import BagEmbedder, EmbeddingStore, FaceEmbedder, FaceQuality
 from .events import EventSink
-from .face_tracker import FaceTracker, FaceTrack
+from .face_tracker import FaceTracker, FaceTrack, FaceIdentity
 from .tracking import Tracker
 from .video import open_video_source, read_frame, release
 
@@ -93,10 +99,11 @@ class Pipeline:
     2. Face bounding boxes are drawn instead of body boxes
     3. FaceTracker handles re-identification with gallery matching
     4. Bags are linked to owners with persistent tracking
-    5. Database stores all relationships
+    5. Database stores all relationships with session continuity
+    6. Periodic saves and cleanup for 24/7 operation
     """
 
-    def __init__(self, cfg: PipelineConfig):
+    def __init__(self, cfg: PipelineConfig, db_path: str = "antiterror.db"):
         # Adjust device globally
         cfg.detection.device = select_device(cfg.detection.device)
         cfg.embeddings.device = select_device(cfg.embeddings.device)
@@ -104,7 +111,10 @@ class Pipeline:
         self.cfg = cfg
 
         # Database for persistent storage
-        self.db = Database("antiterror.db")
+        self.db = Database(db_path)
+
+        # Start a new session
+        self.session_id = self.db.start_session(cfg.events.camera_id)
 
         # Object detection (for bags)
         self.detector = Detector(cfg.detection)
@@ -113,8 +123,8 @@ class Pipeline:
         # Face detection and embedding
         self.face_embedder = FaceEmbedder(cfg.embeddings)
 
-        # Face-specific tracker with re-identification
-        self.face_tracker = FaceTracker(cfg.tracking, cfg.embeddings)
+        # Face-specific tracker with re-identification and identity registry
+        self.face_tracker = FaceTracker(cfg.tracking, cfg.embeddings, cfg.identity)
 
         # Bag handling
         self.bag_embedder = BagEmbedder(cfg.embeddings)
@@ -133,10 +143,98 @@ class Pipeline:
         self.render_enabled: bool = True
         self.preview: Optional[PreviewServer] = None
 
-        # Frame counter for periodic DB updates
+        # Frame counter for periodic operations
         self.frame_count = 0
 
-        logger.info("Pipeline initialized with face-centric tracking and database")
+        # Initialize from database (load previous session state)
+        self._initialize_from_database()
+
+        logger.info(f"Pipeline initialized with session {self.session_id}")
+
+    def _initialize_from_database(self) -> None:
+        """Load state from database for session continuity."""
+        # Load identity gallery
+        gallery_data = self.db.load_gallery(
+            max_identities=self.cfg.identity.max_gallery_size,
+            ttl_hours=self.cfg.identity.identity_ttl_hours
+        )
+
+        # Restore gallery identities
+        loaded_count = 0
+        for person_id, data in gallery_data.items():
+            if data['embeddings']:
+                # Create FaceIdentity from stored data
+                identity = FaceIdentity(
+                    identity_id=person_id,
+                    initial_embedding=data['embeddings'][0],
+                    quality=data['qualities'][0] if data['qualities'] else 1.0
+                )
+
+                # Add remaining embeddings
+                for emb, quality in zip(data['embeddings'][1:], data['qualities'][1:]):
+                    identity.add_embedding(emb, quality)
+
+                # Restore centroid if available
+                if data['centroid'] is not None:
+                    identity.centroid = data['centroid']
+
+                # Set last seen time
+                identity.last_seen_time = data['last_seen']
+
+                # Add to gallery
+                self.face_tracker.gallery.identities[person_id] = identity
+
+                # Update registry LRU
+                self.face_tracker.registry.person_last_seen[person_id] = data['last_seen']
+
+                loaded_count += 1
+
+        # Update gallery counter to continue from last ID
+        if gallery_data:
+            max_num = 0
+            for pid in gallery_data.keys():
+                if pid.startswith('P_'):
+                    try:
+                        num = int(pid.split('_')[1])
+                        max_num = max(max_num, num)
+                    except (ValueError, IndexError):
+                        pass
+            self.face_tracker.gallery.counter = max_num
+
+        logger.info(f"Loaded {loaded_count} identities from database")
+
+        # Load bag ownerships (optional - for hot restart)
+        ownerships = self.db.load_bag_ownerships(
+            max_age_hours=self.cfg.identity.identity_ttl_hours
+        )
+        logger.info(f"Loaded {len(ownerships)} bag ownership records")
+
+    def _periodic_save(self) -> None:
+        """Save state to database periodically."""
+        # Save gallery identities
+        self.db.save_gallery_batch(self.face_tracker.gallery.identities)
+
+        # Save bag ownerships
+        self.db.save_ownerships_batch(self.assoc.bag_ownerships, self.session_id)
+
+        logger.debug(f"Periodic save: {len(self.face_tracker.gallery.identities)} identities, "
+                     f"{len(self.assoc.bag_ownerships)} ownerships")
+
+    def _cleanup_stale_data(self) -> None:
+        """Clean up stale data to prevent memory leaks."""
+        # Evict stale identities from registry
+        evicted = self.face_tracker.registry.evict_stale_identities()
+
+        # Clean up expired lost tracks
+        self.face_tracker.registry.cleanup_expired_lost_tracks()
+
+        # Clean old database records
+        if self.frame_count % (self.cfg.identity.cleanup_interval_frames * 10) == 0:
+            # Less frequent DB cleanup (every ~5 minutes)
+            self.db.cleanup_old_data(max_age_hours=24.0)
+
+        if evicted:
+            logger.debug(f"Cleanup: evicted {len(evicted)} stale identities")
 
     def process_frame(self, frame: np.ndarray) -> None:
         """Process a single video frame.
@@ -185,23 +283,33 @@ class Pipeline:
         tracks = self.tracker.update(detection.boxes, detection.scores, detection.classes)
         bag_tracks = [t for t in tracks if t.cls in self.cfg.detection.classes_bag]
 
-        # Assign bag IDs via embeddings
+        # Assign bag IDs via embeddings with improved matching
         bag_ids: Dict[int, str] = {}
         for bag in bag_tracks:
             x1, y1, x2, y2 = bag.box.astype(int)
+            # Validate coordinates
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(x2, frame.shape[1]), min(y2, frame.shape[0])
+            if x2 <= x1 or y2 <= y1:
+                continue
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
             emb = self.bag_embedder(crop)
-            label, created, _ = self.bag_store.match_or_create(
+            label, created, score = self.bag_store.match_or_create(
                 emb,
                 prefix="B",
                 threshold=self.cfg.embeddings.bag_similarity_threshold,
+                force_threshold=getattr(self.cfg.embeddings, 'bag_force_match_threshold', 0.45),
                 image=cv2.cvtColor(crop, cv2.COLOR_BGR2RGB),
                 save_dir=self.cfg.persistence.bags_dir if self.cfg.persistence.save_bags else None,
-                strict_mode=True,  # Bags need separate IDs, not aggressive merging
+                strict_mode=True,  # Bags use force_threshold logic
+                track_frames_seen=bag.frames_seen,
+                patience_frames=getattr(self.cfg.embeddings, 'bag_new_id_patience_frames', 5),
             )
-            bag_ids[bag.track_id] = label
+            # Only assign if we got a valid label
+            if label:
+                bag_ids[bag.track_id] = label
 
         # === Association ===
         # Create person_ids dict from face tracks
@@ -221,6 +329,14 @@ class Pipeline:
         # === Update Database (periodically) ===
         if self.frame_count % 30 == 0:  # Every ~1 second at 30fps
             self._update_database(person_ids, bag_ids, assignments)
+
+        # === Periodic save (every ~10 seconds) ===
+        if self.frame_count % self.cfg.identity.db_save_interval_frames == 0:
+            self._periodic_save()
+
+        # === Periodic cleanup (every ~30 seconds) ===
+        if self.frame_count % self.cfg.identity.cleanup_interval_frames == 0:
+            self._cleanup_stale_data()
 
         # === Behavior Analysis ===
         events = self.behavior.update(bag_tracks, bag_ids, person_ids, assignments)
@@ -356,9 +472,14 @@ class Pipeline:
         num_bags = len(bag_tracks)
         ownerships = self.assoc.get_all_ownerships()
         num_owned = len(ownerships)
+        registry_stats = self.face_tracker.registry.get_stats()
 
         stats_text = f"Faces: {num_faces} | IDs: {num_ids} | Bags: {num_bags} | Owned: {num_owned}"
         cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Show registry stats (lost tracks for relink)
+        lost_text = f"Lost tracks: {registry_stats['lost_tracks']} | Session: {self.session_id}"
+        cv2.putText(frame, lost_text, (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
         # Show ownership summary
         y_offset = 55
@@ -388,7 +509,7 @@ class Pipeline:
 
     def run(self) -> None:
         """Run the pipeline on video source."""
-        logger.info("Starting face-centric pipeline. Press 'q' to exit.")
+        logger.info(f"Starting face-centric pipeline (session {self.session_id}). Press 'q' to exit.")
         try:
             while True:
                 frame = read_frame(self.cap)
@@ -398,22 +519,46 @@ class Pipeline:
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
         finally:
-            release(self.cap)
-            if self.render_enabled:
-                try:
-                    cv2.destroyAllWindows()
-                except Exception as e:
-                    logger.warning(f"cv2.destroyAllWindows failed: {e}")
-            if self.preview:
-                self.preview.stop()
+            self._shutdown()
 
-            # Log final stats
-            num_ids = len(self.face_tracker.gallery.get_all_ids())
-            db_stats = self.db.get_stats()
-            logger.info(f"Final stats: {num_ids} faces, {db_stats}")
+    def _shutdown(self) -> None:
+        """Clean shutdown with state persistence."""
+        logger.info("Shutting down pipeline...")
 
-            # Close database
-            self.db.close()
+        # Final save before exit
+        try:
+            self._periodic_save()
+            logger.info("Final state saved to database")
+        except Exception as e:
+            logger.error(f"Failed to save final state: {e}")
+
+        # End session
+        try:
+            self.db.end_session(self.session_id)
+        except Exception as e:
+            logger.error(f"Failed to end session: {e}")
+
+        # Release video
+        release(self.cap)
+
+        # Cleanup GUI
+        if self.render_enabled:
+            try:
+                cv2.destroyAllWindows()
+            except Exception as e:
+                logger.warning(f"cv2.destroyAllWindows failed: {e}")
+
+        if self.preview:
+            self.preview.stop()
+
+        # Log final stats
+        num_ids = len(self.face_tracker.gallery.get_all_ids())
+        registry_stats = self.face_tracker.registry.get_stats()
+        db_stats = self.db.get_stats()
+        logger.info(f"Final stats: {num_ids} faces, registry: {registry_stats}, db: {db_stats}")
+
+        # Close database
+        self.db.close()
 
 
 def parse_args():
@@ -424,6 +569,13 @@ def parse_args():
     parser.add_argument("--abandonment-timeout", type=float, default=None, help="Seconds to flag abandoned bag")
     parser.add_argument("--db", type=str, default="antiterror.db", help="Database file path")
     parser.add_argument("--preview-port", type=int, default=None, help="Start MJPEG preview server on this port")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "mps", "cpu"],
+        help="Compute device: cuda (NVIDIA), mps (Apple Silicon), cpu"
+    )
     return parser.parse_args()
 
 
@@ -432,12 +584,17 @@ def main():
     source: str | int = int(args.source) if args.source.isdigit() else args.source
     cfg = PipelineConfig(video_source=source)
     cfg.events.camera_id = args.camera_id
+
+    # Set device for all components
+    cfg.detection.device = args.device
+    cfg.embeddings.device = args.device
+
     if args.conf is not None:
         cfg.detection.conf_threshold = args.conf
     if args.abandonment_timeout is not None:
         cfg.behavior.abandonment_timeout_s = args.abandonment_timeout
 
-    pipeline = Pipeline(cfg)
+    pipeline = Pipeline(cfg, db_path=args.db)
     if args.preview_port:
         pipeline.preview = PreviewServer(args.preview_port)
         pipeline.render_enabled = False  # disable GUI render if serving over HTTP

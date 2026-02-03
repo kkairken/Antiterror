@@ -66,6 +66,12 @@ class EmbeddingSample:
 
 
 class BagEmbedder:
+    """Enhanced bag embedding with multiple feature types.
+
+    Combines CNN features + color histogram + shape features for more robust
+    bag re-identification. This compensates for ResNet's generic training.
+    """
+
     def __init__(self, cfg: EmbeddingConfig):
         device = select_device(cfg.device)
         if cfg.bag_model_name.lower() == "resnet50":
@@ -77,6 +83,8 @@ class BagEmbedder:
         self.model = backbone
         self.device = device
         self.cfg = cfg
+        self.use_color = getattr(cfg, 'bag_use_color_histogram', True)
+        self.use_shape = getattr(cfg, 'bag_use_shape_features', True)
         self.transform = transforms.Compose(
             [
                 transforms.ToPILImage(),
@@ -85,14 +93,87 @@ class BagEmbedder:
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
-        logger.info(f"Bag embedder ready on {device}")
+        feature_desc = "CNN"
+        if self.use_color:
+            feature_desc += "+Color"
+        if self.use_shape:
+            feature_desc += "+Shape"
+        logger.info(f"Bag embedder ready on {device} ({feature_desc})")
+
+    def _compute_color_histogram(self, crop: np.ndarray) -> np.ndarray:
+        """Compute normalized color histogram in HSV space.
+
+        HSV is more robust to lighting changes than RGB.
+        Returns 96-dim vector (32 bins x 3 channels).
+        """
+        try:
+            hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+            hist = []
+            for channel in range(3):
+                h, _ = np.histogram(hsv[:, :, channel], bins=32, range=(0, 256))
+                h = h.astype(np.float32)
+                h = h / (h.sum() + 1e-6)  # Normalize
+                hist.extend(h)
+            return np.array(hist, dtype=np.float32)
+        except Exception:
+            return np.zeros(96, dtype=np.float32)
+
+    def _compute_shape_features(self, crop: np.ndarray) -> np.ndarray:
+        """Compute shape descriptors.
+
+        Returns 4-dim vector: aspect ratio, log area, compactness, inverse aspect.
+        """
+        try:
+            h, w = crop.shape[:2]
+            aspect_ratio = w / (h + 1e-6)
+            area = h * w
+            perimeter = 2 * (h + w)
+            compactness = (4 * np.pi * area) / (perimeter ** 2 + 1e-6)
+            return np.array([
+                aspect_ratio,
+                np.log(area + 1),
+                compactness,
+                h / (w + 1e-6)
+            ], dtype=np.float32)
+        except Exception:
+            return np.zeros(4, dtype=np.float32)
 
     @torch.inference_mode()
     def __call__(self, crop: np.ndarray) -> torch.Tensor:
+        """Extract multi-feature embedding from bag crop.
+
+        Returns normalized embedding combining:
+        - CNN features (2048-dim from ResNet50)
+        - Color histogram (96-dim, optional)
+        - Shape features (4-dim, optional)
+        """
+        # 1. CNN features
         tensor = self.transform(crop).unsqueeze(0).to(self.device)
-        emb = self.model(tensor).flatten(1)
-        emb = F.normalize(emb, dim=1)
-        return emb.cpu().squeeze(0)
+        cnn_emb = self.model(tensor).flatten(1)
+        cnn_emb = F.normalize(cnn_emb, dim=1).cpu().squeeze(0)
+
+        if not self.use_color and not self.use_shape:
+            return cnn_emb
+
+        features = [cnn_emb]
+
+        # 2. Color histogram (robust to viewpoint changes)
+        if self.use_color:
+            color_hist = self._compute_color_histogram(crop)
+            # Scale color features to similar magnitude as CNN
+            color_tensor = torch.tensor(color_hist, dtype=torch.float32) * 0.5
+            features.append(color_tensor)
+
+        # 3. Shape features (aspect ratio, compactness)
+        if self.use_shape:
+            shape_feat = self._compute_shape_features(crop)
+            # Scale shape features
+            shape_tensor = torch.tensor(shape_feat, dtype=torch.float32) * 0.3
+            features.append(shape_tensor)
+
+        # Concatenate and normalize
+        combined = torch.cat(features)
+        return F.normalize(combined, dim=0)
 
 
 class FaceEmbedder:
@@ -106,15 +187,27 @@ class FaceEmbedder:
         self.cfg = cfg
         self.provider = cfg.face_provider.lower()
         if self.provider == "insightface" and FaceAnalysis is not None:
-            # Try GPU first, fallback to CPU
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            # Select providers based on platform
+            # - CUDA for NVIDIA GPUs (Linux/Windows)
+            # - CoreML for Apple Silicon (macOS M1/M2/M3/M4)
+            # - CPU as fallback
+            device = select_device(cfg.device)
+            if device == "cuda":
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            elif device == "mps":
+                # Apple Silicon: CoreML provides GPU acceleration
+                providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+            else:
+                providers = ["CPUExecutionProvider"]
+
             # Use buffalo_l model for better accuracy (ArcFace R100)
             # buffalo_l has best recognition accuracy among InsightFace models
             self.model = FaceAnalysis(
                 name=cfg.face_model_name,  # "buffalo_l" for best quality
                 providers=providers
             )
-            ctx_id = 0 if select_device(cfg.device) == "cuda" else -1
+            # ctx_id: 0 for GPU (CUDA), -1 for CPU/CoreML
+            ctx_id = 0 if device == "cuda" else -1
             # Larger det_size improves small face detection
             self.model.prepare(ctx_id=ctx_id, det_size=(640, 640))
             logger.info(f"Face embedder ready (InsightFace {cfg.face_model_name})")
@@ -355,14 +448,25 @@ class EmbeddingStore:
         create_threshold: float | None = None,
         quality: float = 1.0,
         strict_mode: bool = False,
+        track_frames_seen: int = 1,
+        patience_frames: int = 1,
     ) -> tuple[str, bool, float]:
         """Return (label, created_new, best_score).
 
         Args:
-            strict_mode: If True (for bags), only match if truly above threshold.
-                        If False (for faces), use aggressive merging to reduce duplicates.
+            threshold: Primary similarity threshold for matching
+            force_threshold: Secondary threshold to force match (prevents duplicates)
+            create_threshold: Minimum score to even consider creating new ID
+            quality: Quality score for this embedding
+            strict_mode: If True (for bags), use force_threshold logic instead of aggressive merging
+            track_frames_seen: How many frames this track has been observed
+            patience_frames: Wait this many frames before creating new ID
         """
         if not self.samples:
+            # First bag ever - but check patience
+            if track_frames_seen < patience_frames:
+                # Not enough frames - return empty (no ID yet)
+                return "", False, 0.0
             label = self._new_label(prefix)
             path = self._maybe_save(image, save_dir, label)
             self.samples[label] = EmbeddingSample(
@@ -381,8 +485,22 @@ class EmbeddingStore:
             self.add_embedding(best_label, emb, quality)
             return best_label, False, best_score
 
-        # For strict mode (bags): only match if above threshold, otherwise create new
+        # For strict mode (bags): use force_threshold to prevent duplicates
         if strict_mode:
+            # Force-match if above force_threshold (even if below primary)
+            if force_threshold is not None and best_label and best_score >= force_threshold:
+                logger.debug(f"Force-matching bag to {best_label} (score={best_score:.3f})")
+                self.add_embedding(best_label, emb, quality)
+                return best_label, False, best_score
+
+            # Patience check - don't create ID until enough frames observed
+            if track_frames_seen < patience_frames:
+                # Return best match tentatively (not creating new ID yet)
+                if best_label:
+                    return best_label, False, best_score
+                return "", False, 0.0
+
+            # Create new ID only after patience period and truly no match
             label = self._new_label(prefix)
             path = self._maybe_save(image, save_dir, label)
             self.samples[label] = EmbeddingSample(
@@ -392,7 +510,7 @@ class EmbeddingStore:
                 centroid=emb.clone(),
                 quality_scores=[quality]
             )
-            logger.info(f"Created new ID {label} (strict mode, best_score was {best_score:.3f})")
+            logger.info(f"Created new bag ID {label} (best_score was {best_score:.3f}, frames={track_frames_seen})")
             return label, True, best_score
 
         # --- Below is aggressive matching for faces only (strict_mode=False) ---

@@ -1,0 +1,23 @@
+# Requirements for macOS (Apple Silicon M1/M2/M3/M4)
+# Install with: pip install -r requirements-macos.txt
+
+ultralytics>=8.3.0
+supervision>=0.23.0
+opencv-python>=4.10.0.84
+torch>=2.3.0
+torchvision>=0.18.0
+numpy>=1.26.4
+loguru>=0.7.2
+facenet-pytorch>=2.5.3
+shapely>=2.0.4
+insightface>=0.7.3
+
+# macOS uses onnxruntime (not onnxruntime-gpu)
+# CoreML execution provider is included in base onnxruntime on macOS
+onnxruntime>=1.17.1
+
+# Optional: CoreML tools for model conversion optimization
+coremltools>=7.0
+
+# SSL certificates for macOS (fixes download issues)
+certifi>=2024.0.0

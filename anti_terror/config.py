@@ -11,7 +11,7 @@ class DetectionConfig:
 
     # Detection thresholds
     conf_threshold: float = 0.35  # For persons
-    bag_conf_threshold: float = 0.20  # Lower threshold for bags (harder to detect)
+    bag_conf_threshold: float = 0.35  # Raised from 0.20 to reduce false positives
     iou_threshold: float = 0.45
 
     # Input size - larger = better small object detection
@@ -33,11 +33,11 @@ class DetectionConfig:
 @dataclass
 class TrackingConfig:
     # ByteTrack params tuned for real-time webcam
-    track_activation_threshold: float = 0.35
-    lost_track_buffer: int = 30
-    minimum_matching_threshold: float = 0.8
+    track_activation_threshold: float = 0.30  # Slightly lower for bags
+    lost_track_buffer: int = 90  # 3 seconds at 30fps (was 30) - survives brief occlusions
+    minimum_matching_threshold: float = 0.75  # Slightly more permissive
     frame_rate: int = 30
-    minimum_consecutive_frames: int = 1
+    minimum_consecutive_frames: int = 3  # Filter flicker detections (was 1)
 
 
 @dataclass
@@ -68,7 +68,11 @@ class EmbeddingConfig:
     # Bag embedding config
     bag_model_name: str = "resnet50"
     bag_embedding_size: int = 2048
-    bag_similarity_threshold: float = 0.7  # cosine similarity to attach to existing BagID
+    bag_similarity_threshold: float = 0.55  # Lowered from 0.7 for weak ResNet features
+    bag_force_match_threshold: float = 0.45  # Force match above this to prevent duplicates
+    bag_new_id_patience_frames: int = 5  # Wait before creating new bag ID
+    bag_use_color_histogram: bool = True  # Add color features for better matching
+    bag_use_shape_features: bool = True  # Add shape features for better matching
 
     # Face matching thresholds - CRITICAL for reducing duplicates
     # These are optimized for ArcFace/InsightFace embeddings
@@ -82,17 +86,62 @@ class EmbeddingConfig:
 
 
 @dataclass
+class IdentityConfig:
+    """Configuration for identity management and memory bounds."""
+    # Memory limits
+    max_gallery_size: int = 500  # Maximum identities in memory
+    identity_ttl_hours: float = 8.0  # TTL for eviction (hours)
+
+    # Relink after occlusion
+    relink_window_s: float = 30.0  # Window for relink after track loss
+    relink_threshold: float = 0.45  # Similarity threshold for relink
+
+    # Maintenance intervals (in frames, ~30fps)
+    cleanup_interval_frames: int = 900  # ~30 seconds
+    db_save_interval_frames: int = 300  # ~10 seconds
+
+    # Track association
+    track_merge_threshold: float = 0.50  # Threshold to merge tracks
+
+
+@dataclass
 class AssociationConfig:
-    max_link_distance_px: int = 120
+    # Distance thresholds
+    max_link_distance_px: int = 150  # Increased from 120 for better coverage
+    carrying_distance_px: int = 80  # Very close = definitely carrying
+    far_distance_px: int = 300  # Far = can see but not carrying
+
     iou_threshold: float = 0.2
-    time_consistency_frames: int = 8
+    carrying_iou_threshold: float = 0.1  # Bag overlaps with person body
+
+    # Ownership validation
+    time_consistency_frames: int = 10  # Was 8
+    transfer_confirmation_frames: int = 30  # ~1 sec for ownership transfer
+    minimum_validation_frames: int = 15  # ~0.5 sec to validate ownership
+    minimum_validation_confidence: float = 0.6
+
+    # Temporal voting (new)
+    history_window_frames: int = 60  # ~2 seconds of history
+    ambiguity_margin: float = 0.15  # Score margin between candidates for ambiguity
+
+    # Confidence decay when owner not visible
+    confidence_decay_rate: float = 0.05  # Decay per second
+    min_confidence_floor: float = 0.1  # Minimum confidence (never fully lose ownership)
+
+    # Scoring weights for temporal voting
+    weight_proximity: float = 0.50  # 50% proximity
+    weight_temporal: float = 0.30  # 30% temporal consistency
+    weight_iou: float = 0.20  # 20% IoU overlap
 
 
 @dataclass
 class BehaviorConfig:
-    abandonment_timeout_s: float = 7.0  # suspicious if bag is static and owner gone for this long
-    static_iou_threshold: float = 0.8  # bag considered static if current vs last bbox IoU
-    owner_distance_px: int = 200  # person considered away if center distance exceeds this
+    abandonment_timeout_s: float = 10.0  # Increased from 7.0 for fewer false alarms
+    static_iou_threshold: float = 0.7  # Lowered from 0.8 - more tolerant of small movements
+    owner_distance_px: int = 250  # Increased from 200
+    alert_cooldown_s: float = 30.0  # Don't re-alert same bag for 30 seconds
+    stale_track_timeout_s: float = 60.0  # Remove tracks not updated for 60s
+    min_confidence_for_abandonment: float = 0.5  # Minimum ownership confidence
 
 
 @dataclass
@@ -120,15 +169,25 @@ class PipelineConfig:
     behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
     events: EventConfig = field(default_factory=EventConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+    identity: IdentityConfig = field(default_factory=IdentityConfig)
 
 
 def select_device(requested: str) -> str:
-    """Pick device string depending on availability."""
+    """Pick device string depending on availability.
+
+    Supports:
+    - cuda: NVIDIA GPU (Linux/Windows)
+    - mps: Apple Silicon GPU (macOS M1/M2/M3/M4)
+    - cpu: Fallback for all platforms
+    """
     try:
         import torch
 
         if requested == "cuda" and torch.cuda.is_available():
             return "cuda"
+        # Apple Silicon (M1/M2/M3/M4) support via Metal Performance Shaders
+        if requested in ("cuda", "mps") and torch.backends.mps.is_available():
+            return "mps"
     except Exception:
         return "cpu"
     return "cpu"

@@ -25,30 +25,19 @@ class Detector:
 
     Key improvements for bag detection:
     1. Uses YOLO11x (most accurate model)
-    2. Lower confidence threshold for bags (they're harder to detect)
+    2. Tuned confidence thresholds for production stability
     3. Multi-scale detection with augmentation
-    4. Expanded bag classes including luggage variants
+    4. Strict bag classes only (no false positives from umbrellas, etc.)
     """
 
-    # COCO class IDs for bags and bag-like objects
+    # COCO class IDs for bags ONLY - strict filtering
+    # Removed: umbrella, tie, frisbee, skis, snowboard, sports ball, etc.
+    # These were causing too many false positives
     BAG_CLASSES = {
         24: "backpack",
         26: "handbag",
         28: "suitcase",
-        # Additional classes that might be bags
-        25: "umbrella",  # often held like bags
-        27: "tie",  # sometimes misdetected
-        29: "frisbee",  # round objects
-        31: "skis",  # long objects
-        32: "snowboard",
-        33: "sports ball",
-        37: "skateboard",
-        38: "surfboard",
-        39: "tennis racket",
     }
-
-    # Primary bag classes (high priority)
-    PRIMARY_BAG_CLASSES = {24, 26, 28}  # backpack, handbag, suitcase
 
     def __init__(self, cfg: DetectionConfig):
         device = select_device(cfg.device)
@@ -110,29 +99,3 @@ class Detector:
             scores=scores[keep_mask],
             classes=classes[keep_mask]
         )
-
-    def detect_bags_only(self, frame: np.ndarray) -> DetectionResult:
-        """Detect only bags with very low threshold for maximum recall."""
-        results = self.model.predict(
-            frame,
-            conf=0.15,  # Very low threshold
-            iou=0.3,
-            device=self.model.device,
-            verbose=False,
-            imgsz=self.cfg.imgsz,
-            augment=True,  # Always use augmentation for bags
-            classes=list(self.cfg.classes_bag),  # Only detect bag classes
-        )[0]
-
-        if len(results.boxes) == 0:
-            return DetectionResult(
-                boxes=np.array([]).reshape(0, 4),
-                scores=np.array([]),
-                classes=np.array([])
-            )
-
-        boxes = results.boxes.xyxy.cpu().numpy()
-        scores = results.boxes.conf.cpu().numpy()
-        classes = results.boxes.cls.cpu().numpy().astype(int)
-
-        return DetectionResult(boxes=boxes, scores=scores, classes=classes)

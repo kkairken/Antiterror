@@ -2,11 +2,16 @@
 
 This module provides robust face tracking with embedding-based re-identification
 to minimize duplicate ID creation.
+
+Key features:
+- IdentityRegistry for track-to-person mapping with relink after occlusion
+- FaceGallery with memory bounds and LRU eviction
+- Temporal consistency for stable ID assignment
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import time
 
 import numpy as np
@@ -16,7 +21,7 @@ from loguru import logger
 from supervision import Detections
 from supervision.tracker.byte_tracker.core import ByteTrack
 
-from .config import EmbeddingConfig, TrackingConfig
+from .config import EmbeddingConfig, IdentityConfig, TrackingConfig
 
 
 @dataclass
@@ -51,10 +56,12 @@ class FaceGallery:
     1. Centroid-based matching with quality weighting
     2. Temporal consistency checks
     3. Adaptive thresholds based on gallery size
+    4. Memory bounds via IdentityConfig
     """
 
-    def __init__(self, cfg: EmbeddingConfig):
+    def __init__(self, cfg: EmbeddingConfig, identity_cfg: IdentityConfig | None = None):
         self.cfg = cfg
+        self.identity_cfg = identity_cfg or IdentityConfig()
         self.identities: Dict[str, FaceIdentity] = {}
         self.counter = 0
         self.last_creation_time = 0.0
@@ -221,18 +228,212 @@ class FaceIdentity:
         return 0.6 * centroid_sim + 0.4 * recent_max
 
 
+@dataclass
+class TrackHistory:
+    """History of a track_id for a person."""
+    track_id: int
+    start_time: float
+    end_time: float
+    embedding: torch.Tensor | None = None
+
+
+class IdentityRegistry:
+    """Registry for managing track_id to person_id mappings.
+
+    Solves the critical problem of track ID loss during occlusion:
+    - Maintains bidirectional mapping between track_ids and person_ids
+    - Supports relinking after ByteTrack loses a track
+    - Implements LRU eviction for memory bounds
+    """
+
+    def __init__(self, cfg: IdentityConfig, gallery: 'FaceGallery'):
+        self.cfg = cfg
+        self.gallery = gallery
+
+        # Bidirectional mappings
+        self.track_to_person: Dict[int, str] = {}  # track_id -> person_id
+        self.person_to_tracks: Dict[str, Set[int]] = {}  # person_id -> set of track_ids
+
+        # Track history for relink (stores recent lost tracks)
+        self.lost_tracks: Dict[int, TrackHistory] = {}  # track_id -> history
+
+        # LRU tracking for eviction
+        self.person_last_seen: Dict[str, float] = {}  # person_id -> timestamp
+
+        logger.info("IdentityRegistry initialized")
+
+    def register_track(self, track_id: int, person_id: str, embedding: torch.Tensor | None = None) -> None:
+        """Register a track_id to person_id mapping."""
+        now = time.time()
+
+        # Update mappings
+        self.track_to_person[track_id] = person_id
+
+        if person_id not in self.person_to_tracks:
+            self.person_to_tracks[person_id] = set()
+        self.person_to_tracks[person_id].add(track_id)
+
+        # Update LRU
+        self.person_last_seen[person_id] = now
+
+    def get_person_id(self, track_id: int) -> str | None:
+        """Get person_id for a track_id."""
+        return self.track_to_person.get(track_id)
+
+    def get_track_ids(self, person_id: str) -> Set[int]:
+        """Get all track_ids for a person_id."""
+        return self.person_to_tracks.get(person_id, set()).copy()
+
+    def mark_track_lost(self, track_id: int, embedding: torch.Tensor | None = None) -> None:
+        """Mark a track as lost (for potential relink later)."""
+        person_id = self.track_to_person.get(track_id)
+        if not person_id:
+            return
+
+        now = time.time()
+        self.lost_tracks[track_id] = TrackHistory(
+            track_id=track_id,
+            start_time=now,
+            end_time=now,
+            embedding=embedding
+        )
+
+        # Don't remove from mappings yet - keep for relink window
+        logger.debug(f"Track {track_id} ({person_id}) marked as lost")
+
+    def try_relink(self, new_track_id: int, embedding: torch.Tensor) -> str | None:
+        """Try to relink a new track_id to a recently lost person.
+
+        Returns person_id if relink successful, None otherwise.
+        """
+        now = time.time()
+        best_person = None
+        best_score = 0.0
+
+        # Check all lost tracks within relink window
+        for lost_track_id, history in list(self.lost_tracks.items()):
+            if now - history.start_time > self.cfg.relink_window_s:
+                # Expired - remove
+                self._cleanup_lost_track(lost_track_id)
+                continue
+
+            person_id = self.track_to_person.get(lost_track_id)
+            if not person_id:
+                continue
+
+            # Compare with gallery identity
+            if person_id in self.gallery.identities:
+                score = self.gallery.identities[person_id].match_score(embedding)
+                if score >= self.cfg.relink_threshold and score > best_score:
+                    best_score = score
+                    best_person = person_id
+
+        if best_person:
+            logger.info(f"Relinked track {new_track_id} to {best_person} (score: {best_score:.3f})")
+            self.register_track(new_track_id, best_person, embedding)
+            return best_person
+
+        return None
+
+    def _cleanup_lost_track(self, track_id: int) -> None:
+        """Cleanup a lost track from registry."""
+        if track_id in self.lost_tracks:
+            del self.lost_tracks[track_id]
+
+        # Optionally remove from track_to_person if truly stale
+        # (but keep person_to_tracks for identity persistence)
+
+    def update_seen(self, person_id: str) -> None:
+        """Update last seen time for a person."""
+        self.person_last_seen[person_id] = time.time()
+
+    def evict_stale_identities(self) -> List[str]:
+        """Evict stale identities to maintain memory bounds.
+
+        Uses LRU eviction based on identity_ttl_hours.
+        Returns list of evicted person_ids.
+        """
+        now = time.time()
+        ttl_seconds = self.cfg.identity_ttl_hours * 3600
+        evicted = []
+
+        # Check for TTL-based eviction
+        for person_id, last_seen in list(self.person_last_seen.items()):
+            if now - last_seen > ttl_seconds:
+                self._evict_person(person_id)
+                evicted.append(person_id)
+
+        # Check for size-based eviction
+        while len(self.gallery.identities) > self.cfg.max_gallery_size:
+            # Find LRU person
+            if not self.person_last_seen:
+                break
+
+            oldest_person = min(self.person_last_seen.keys(), key=lambda p: self.person_last_seen[p])
+            self._evict_person(oldest_person)
+            evicted.append(oldest_person)
+
+        if evicted:
+            logger.info(f"Evicted {len(evicted)} stale identities: {evicted}")
+
+        return evicted
+
+    def _evict_person(self, person_id: str) -> None:
+        """Evict a person from all registries."""
+        # Remove from gallery
+        if person_id in self.gallery.identities:
+            del self.gallery.identities[person_id]
+
+        # Remove track mappings
+        if person_id in self.person_to_tracks:
+            for track_id in self.person_to_tracks[person_id]:
+                if track_id in self.track_to_person:
+                    del self.track_to_person[track_id]
+            del self.person_to_tracks[person_id]
+
+        # Remove LRU entry
+        if person_id in self.person_last_seen:
+            del self.person_last_seen[person_id]
+
+    def cleanup_expired_lost_tracks(self) -> None:
+        """Remove expired lost tracks."""
+        now = time.time()
+        expired = [
+            tid for tid, history in self.lost_tracks.items()
+            if now - history.start_time > self.cfg.relink_window_s
+        ]
+        for tid in expired:
+            self._cleanup_lost_track(tid)
+
+    def get_stats(self) -> dict:
+        """Get registry statistics."""
+        return {
+            'active_tracks': len(self.track_to_person),
+            'known_persons': len(self.person_to_tracks),
+            'lost_tracks': len(self.lost_tracks),
+            'gallery_size': len(self.gallery.identities),
+        }
+
+
 class FaceTracker:
     """Specialized tracker for faces with embedding-based re-identification.
 
     Key features:
     1. ByteTrack for spatial tracking
     2. Embedding matching for re-identification
-    3. Temporal consistency for stable IDs
+    3. IdentityRegistry for track-to-person mapping and relink
+    4. Temporal consistency for stable IDs
     """
 
-    def __init__(self, tracking_cfg: TrackingConfig, embedding_cfg: EmbeddingConfig):
+    def __init__(
+        self,
+        tracking_cfg: TrackingConfig,
+        embedding_cfg: EmbeddingConfig,
+        identity_cfg: IdentityConfig | None = None
+    ):
         self.tracking_cfg = tracking_cfg
         self.embedding_cfg = embedding_cfg
+        self.identity_cfg = identity_cfg or IdentityConfig()
 
         # Spatial tracker (ByteTrack)
         self.byte_tracker = ByteTrack(
@@ -244,12 +445,21 @@ class FaceTracker:
         )
 
         # Identity gallery
-        self.gallery = FaceGallery(embedding_cfg)
+        self.gallery = FaceGallery(embedding_cfg, self.identity_cfg)
+
+        # Identity registry for track-to-person mapping
+        self.registry = IdentityRegistry(self.identity_cfg, self.gallery)
 
         # Active tracks
         self.tracks: Dict[int, FaceTrack] = {}
 
-        logger.info("Initialized FaceTracker")
+        # Previous frame's active track IDs (for detecting lost tracks)
+        self._prev_active_tracks: Set[int] = set()
+
+        # Frame counter for periodic cleanup
+        self._frame_count = 0
+
+        logger.info("Initialized FaceTracker with IdentityRegistry")
 
     def update(
         self,
@@ -272,14 +482,20 @@ class FaceTracker:
             List of active FaceTrack objects with assigned person_ids
         """
         current_time = time.time()
+        self._frame_count += 1
 
         # Handle empty detections
         if len(face_boxes) == 0:
             self.byte_tracker.update_with_detections(Detections.empty())
+            # Mark all current tracks as lost
+            for tid in self._prev_active_tracks:
+                if tid in self.tracks:
+                    self.registry.mark_track_lost(tid, self.tracks[tid].embedding)
             # Age out old tracks
             for tid in list(self.tracks.keys()):
                 if current_time - self.tracks[tid].last_seen_time > 2.0:
                     del self.tracks[tid]
+            self._prev_active_tracks = set()
             return []
 
         # Run ByteTrack
@@ -290,11 +506,8 @@ class FaceTracker:
         )
         tracked = self.byte_tracker.update_with_detections(detections)
 
-        # Create detection index for matching
-        det_index = {i: i for i in range(len(face_boxes))}
-
         result: List[FaceTrack] = []
-        active_track_ids = set()
+        active_track_ids: Set[int] = set()
 
         for idx, track_id in enumerate(tracked.tracker_id):
             track_id = int(track_id)
@@ -313,7 +526,8 @@ class FaceTracker:
             crop = face_crops[det_idx] if det_idx < len(face_crops) else None
 
             # Get or create track state
-            if track_id not in self.tracks:
+            is_new_track = track_id not in self.tracks
+            if is_new_track:
                 self.tracks[track_id] = FaceTrack(
                     track_id=track_id,
                     box=box,
@@ -350,27 +564,42 @@ class FaceTracker:
 
             # Assign person_id
             if track.person_id is None:
-                # New track - need to assign ID
-                if track.frames_seen >= self.embedding_cfg.face_new_id_patience_frames:
-                    # Enough frames seen - try to match or create
-                    pid, created, match_score = self.gallery.match_or_create(
-                        track.embedding,
-                        quality=max(track.quality_history) if track.quality_history else quality,
-                        face_crop=crop,
-                        min_quality_for_create=self.embedding_cfg.min_face_quality
-                    )
-                    if pid:
-                        track.person_id = pid
-                else:
-                    # Not enough frames - try to match existing only
-                    best_id, best_score = self.gallery.match(track.embedding, quality)
-                    if best_id and best_score >= self.embedding_cfg.face_similarity_threshold - 0.1:
-                        track.person_id = best_id
-                        self.gallery.identities[best_id].add_embedding(embedding, quality)
+                # New track - first try to relink to recently lost person
+                if is_new_track:
+                    relinked_pid = self.registry.try_relink(track_id, embedding)
+                    if relinked_pid:
+                        track.person_id = relinked_pid
+                        # Update gallery with new observation
+                        if relinked_pid in self.gallery.identities:
+                            self.gallery.identities[relinked_pid].add_embedding(embedding, quality)
+
+                # If not relinked, try normal matching/creation
+                if track.person_id is None:
+                    if track.frames_seen >= self.embedding_cfg.face_new_id_patience_frames:
+                        # Enough frames seen - try to match or create
+                        pid, created, match_score = self.gallery.match_or_create(
+                            track.embedding,
+                            quality=max(track.quality_history) if track.quality_history else quality,
+                            face_crop=crop,
+                            min_quality_for_create=self.embedding_cfg.min_face_quality
+                        )
+                        if pid:
+                            track.person_id = pid
+                            self.registry.register_track(track_id, pid, embedding)
+                    else:
+                        # Not enough frames - try to match existing only
+                        best_id, best_score = self.gallery.match(track.embedding, quality)
+                        if best_id and best_score >= self.embedding_cfg.face_similarity_threshold - 0.1:
+                            track.person_id = best_id
+                            self.registry.register_track(track_id, best_id, embedding)
+                            self.gallery.identities[best_id].add_embedding(embedding, quality)
             else:
                 # Existing track - verify and update
                 current_id = track.person_id
                 best_id, best_score = self.gallery.match(track.embedding, quality)
+
+                # Update registry LRU
+                self.registry.update_seen(current_id)
 
                 # Update gallery with new observation
                 if current_id in self.gallery.identities:
@@ -385,6 +614,7 @@ class FaceTracker:
                             if track.candidate_count >= self.embedding_cfg.face_switch_patience_frames:
                                 logger.info(f"Track {track_id}: switching {current_id} -> {best_id}")
                                 track.person_id = best_id
+                                self.registry.register_track(track_id, best_id, embedding)
                                 track.candidate_id = None
                                 track.candidate_count = 0
                         else:
@@ -396,12 +626,24 @@ class FaceTracker:
 
             result.append(track)
 
+        # Detect lost tracks (were active last frame, not active now)
+        lost_tracks = self._prev_active_tracks - active_track_ids
+        for tid in lost_tracks:
+            if tid in self.tracks:
+                self.registry.mark_track_lost(tid, self.tracks[tid].embedding)
+
         # Cleanup old tracks
         for tid in list(self.tracks.keys()):
             if tid not in active_track_ids:
                 if current_time - self.tracks[tid].last_seen_time > 3.0:
                     del self.tracks[tid]
 
+        # Periodic cleanup
+        if self._frame_count % self.identity_cfg.cleanup_interval_frames == 0:
+            self.registry.evict_stale_identities()
+            self.registry.cleanup_expired_lost_tracks()
+
+        self._prev_active_tracks = active_track_ids
         return result
 
     def _find_detection_idx(self, track_box: np.ndarray, det_boxes: np.ndarray) -> Optional[int]:

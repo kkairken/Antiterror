@@ -1,0 +1,42 @@
+2026-01-31 01:12:47.201 | INFO     | anti_terror.video:open_video_source:9 - Opened video source: 0
+2026-01-31 01:12:47.202 | INFO     | anti_terror.runner:__init__:139 - Pipeline initialized with face-centric tracking and database
+2026-01-31 01:12:47.202 | INFO     | anti_terror.runner:run:391 - Starting face-centric pipeline. Press 'q' to exit.
+2026-01-31 01:13:58.179 | INFO     | anti_terror.video:open_video_source:9 - Opened video source: 0
+2026-01-31 01:13:58.179 | INFO     | anti_terror.runner:__init__:139 - Pipeline initialized with face-centric tracking and database
+2026-01-31 01:13:58.179 | INFO     | anti_terror.runner:__init__:69 - Preview server started at http://localhost:8080
+2026-01-31 01:13:58.180 | INFO     | anti_terror.runner:run:391 - Starting face-centric pipeline. Press 'q' to exit.
+2026-01-31 01:14:06.731 | INFO     | anti_terror.face_tracker:match_or_create:146 - Created new identity P_0001 (best_match: None, score: 0.000)
+2026-01-31 01:14:58.278 | INFO     | anti_terror.embeddings:match_or_create:407 - Created new ID B_0002 (strict mode, best_score was 0.479)
+2026-01-31 01:15:20.503 | INFO     | anti_terror.embeddings:match_or_create:407 - Created new ID B_0003 (strict mode, best_score was 0.690)
+2026-01-31 01:15:21.003 | INFO     | anti_terror.embeddings:match_or_create:407 - Created new ID B_0004 (strict mode, best_score was 0.588)
+2026-01-31 01:15:45.229 | INFO     | anti_terror.face_tracker:match_or_create:146 - Created new identity P_0002 (best_match: P_0001, score: 0.172)
+2026-01-31 01:16:00.736 | INFO     | anti_terror.runner:run:399 - Interrupted by user
+2026-01-31 02:08:45.443 | INFO     | anti_terror.video:open_video_source:9 - Opened video source: 0
+2026-01-31 02:08:45.444 | INFO     | anti_terror.runner:__init__:139 - Pipeline initialized with face-centric tracking and database
+2026-01-31 02:08:45.444 | INFO     | anti_terror.runner:run:401 - Starting face-centric pipeline. Press 'q' to exit.
+2026-01-31 02:08:50.808 | INFO     | anti_terror.face_tracker:match_or_create:146 - Created new identity P_0001 (best_match: None, score: 0.000)
+2026-01-31 02:11:09.744 | INFO     | anti_terror.video:open_video_source:9 - Opened video source: 0
+2026-01-31 02:11:09.744 | INFO     | anti_terror.runner:__init__:139 - Pipeline initialized with face-centric tracking and database
+2026-01-31 02:11:09.744 | INFO     | anti_terror.runner:__init__:69 - Preview server started at http://localhost:8080
+2026-01-31 02:11:09.744 | INFO     | anti_terror.runner:run:401 - Starting face-centric pipeline. Press 'q' to exit.
+2026-01-31 02:11:14.239 | INFO     | anti_terror.face_tracker:match_or_create:146 - Created new identity P_0001 (best_match: None, score: 0.000)
+2026-01-31 02:11:27.734 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag None assigned to owner P_0001 (conf=0.43)
+2026-01-31 02:11:28.289 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag None assigned to owner P_0001 (conf=0.43)
+2026-01-31 02:11:42.973 | WARNING  | anti_terror.behavior:update:164 - ABANDONED BAG: B_0001 (owner: P_0001, away: 10.1s, static: 14.2s)
+2026-01-31 02:11:42.974 | INFO     | anti_terror.events:emit:25 - [ALERT] 2026-01-31 02:11:42 | Abandoned Bag PersonID: P_0001 BagID: B_0001 Camera: CAM_01 details={'timestamp': '2026-01-31 02:11:42', 'camera': 'CAM_01', 'type': 'Abandoned Bag', 'bag_id': 'B_0001', 'person_id': 'P_0001', 'away_for_s': 10.12, 'static_for_s': 14.15, 'alert_count': 1}
+2026-01-31 02:11:46.152 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag B_0001 assigned to owner P_0001 (conf=0.43)
+2026-01-31 02:11:58.897 | WARNING  | anti_terror.behavior:update:164 - ABANDONED BAG: B_0001 (owner: P_0001, away: 10.3s, static: 16.9s)
+2026-01-31 02:11:58.897 | INFO     | anti_terror.events:emit:25 - [ALERT] 2026-01-31 02:11:58 | Abandoned Bag PersonID: P_0001 BagID: B_0001 Camera: CAM_01 details={'timestamp': '2026-01-31 02:11:58', 'camera': 'CAM_01', 'type': 'Abandoned Bag', 'bag_id': 'B_0001', 'person_id': 'P_0001', 'away_for_s': 10.25, 'static_for_s': 16.95, 'alert_count': 1}
+2026-01-31 02:11:59.404 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag B_0001 assigned to owner P_0001 (conf=0.43)
+2026-01-31 02:12:06.713 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag B_0001 assigned to owner P_0001 (conf=0.44)
+2026-01-31 02:12:07.784 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag B_0001 assigned to owner P_0001 (conf=0.42)
+2026-01-31 02:12:07.785 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag B_0001 assigned to owner P_0001 (conf=0.42)
+2026-01-31 02:12:08.325 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag B_0001 assigned to owner P_0001 (conf=0.44)
+2026-01-31 02:12:12.124 | INFO     | anti_terror.association:_update_carrying_ownership:261 - Bag B_0001 assigned to owner P_0001 (conf=0.43)
+2026-01-31 02:12:12.636 | WARNING  | anti_terror.behavior:update:164 - ABANDONED BAG: B_0001 (owner: P_0001, away: 10.2s, static: 14.8s)
+2026-01-31 02:12:12.637 | INFO     | anti_terror.events:emit:25 - [ALERT] 2026-01-31 02:12:12 | Abandoned Bag PersonID: P_0001 BagID: B_0001 Camera: CAM_01 details={'timestamp': '2026-01-31 02:12:12', 'camera': 'CAM_01', 'type': 'Abandoned Bag', 'bag_id': 'B_0001', 'person_id': 'P_0001', 'away_for_s': 10.17, 'static_for_s': 14.8, 'alert_count': 1}
+2026-01-31 02:12:13.121 | WARNING  | anti_terror.behavior:update:164 - ABANDONED BAG: B_0001 (owner: P_0001, away: 40.3s, static: 44.3s)
+2026-01-31 02:12:13.121 | INFO     | anti_terror.events:emit:25 - [ALERT] 2026-01-31 02:12:13 | Abandoned Bag PersonID: P_0001 BagID: B_0001 Camera: CAM_01 details={'timestamp': '2026-01-31 02:12:13', 'camera': 'CAM_01', 'type': 'Abandoned Bag', 'bag_id': 'B_0001', 'person_id': 'P_0001', 'away_for_s': 40.27, 'static_for_s': 44.3, 'alert_count': 2}
+2026-01-31 02:12:20.549 | WARNING  | anti_terror.behavior:update:164 - ABANDONED BAG: B_0001 (owner: P_0001, away: 10.1s, static: 11.7s)
+2026-01-31 02:12:20.550 | INFO     | anti_terror.events:emit:25 - [ALERT] 2026-01-31 02:12:20 | Abandoned Bag PersonID: P_0001 BagID: B_0001 Camera: CAM_01 details={'timestamp': '2026-01-31 02:12:20', 'camera': 'CAM_01', 'type': 'Abandoned Bag', 'bag_id': 'B_0001', 'person_id': 'P_0001', 'away_for_s': 10.05, 'static_for_s': 11.67, 'alert_count': 1}
+2026-01-31 02:12:22.527 | INFO     | anti_terror.runner:run:409 - Interrupted by user

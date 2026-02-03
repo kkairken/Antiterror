@@ -1,0 +1,4 @@
+.venv
+.gitignoregit reset --soft HEAD~1
+
+*.pt

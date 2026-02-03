@@ -1,3 +1,6 @@
+# Requirements for Linux/Windows with NVIDIA GPU
+# For macOS Apple Silicon (M1/M2/M3/M4), use: pip install -r requirements-macos.txt
+
 ultralytics>=8.3.0
 supervision>=0.23.0
 opencv-python>=4.10.0.84
@@ -8,4 +11,4 @@ loguru>=0.7.2
 facenet-pytorch>=2.5.3
 shapely>=2.0.4
 insightface>=0.7.3
-onnxruntime-gpu>=1.17.1
+onnxruntime-gpu>=1.17.1  # Use 'onnxruntime' on macOS instead
