@@ -11,6 +11,7 @@ Modules:
 - behavior: scenario analysis (abandoned bag).
 - events: event formatting/output.
 - runner: pipeline orchestration.
+- service: multi-camera service and frontend hooks.
 """
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "behavior",
     "events",
     "runner",
+    "service",
 ]

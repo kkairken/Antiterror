@@ -103,12 +103,21 @@ class Pipeline:
     6. Periodic saves and cleanup for 24/7 operation
     """
 
-    def __init__(self, cfg: PipelineConfig, db_path: str = "antiterror.db"):
+    def __init__(
+        self,
+        cfg: PipelineConfig,
+        db_path: str = "antiterror.db",
+        frame_callback=None,
+        event_callback=None,
+    ):
         # Adjust device globally
         cfg.detection.device = select_device(cfg.detection.device)
         cfg.embeddings.device = select_device(cfg.embeddings.device)
 
         self.cfg = cfg
+        self.frame_callback = frame_callback
+        self.event_callback = event_callback
+        self._stop_event = threading.Event()
 
         # Database for persistent storage
         self.db = Database(db_path)
@@ -342,6 +351,11 @@ class Pipeline:
         events = self.behavior.update(bag_tracks, bag_ids, person_ids, assignments)
         if events:
             self.events.emit(events)
+            if self.event_callback:
+                try:
+                    self.event_callback(events)
+                except Exception as e:
+                    logger.warning(f"Event callback failed: {e}")
             # Log events to database
             for event in events:
                 self.db.log_event(
@@ -498,6 +512,20 @@ class Pipeline:
         if self.preview:
             self.preview.update(frame)
 
+        if self.frame_callback:
+            try:
+                stats = {
+                    "camera_id": self.cfg.events.camera_id,
+                    "faces": num_faces,
+                    "ids": num_ids,
+                    "bags": num_bags,
+                    "owned": num_owned,
+                    "session_id": self.session_id,
+                }
+                self.frame_callback(frame, stats)
+            except Exception as e:
+                logger.warning(f"Frame callback failed: {e}")
+
         if self.render_enabled:
             try:
                 cv2.imshow("AntiTerror - Face & Bag Tracking", frame)
@@ -511,7 +539,7 @@ class Pipeline:
         """Run the pipeline on video source."""
         logger.info(f"Starting face-centric pipeline (session {self.session_id}). Press 'q' to exit.")
         try:
-            while True:
+            while not self._stop_event.is_set():
                 frame = read_frame(self.cap)
                 if frame is None:
                     break
@@ -520,6 +548,10 @@ class Pipeline:
             logger.info("Interrupted by user")
         finally:
             self._shutdown()
+
+    def stop(self) -> None:
+        """Request the pipeline loop to stop."""
+        self._stop_event.set()
 
     def _shutdown(self) -> None:
         """Clean shutdown with state persistence."""
